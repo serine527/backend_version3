@@ -120,3 +120,10 @@ class Ticket(Base):
     queue = relationship("Queue", back_populates="tickets")
     agent = relationship("Agent", back_populates="tickets")
     service = relationship("Service")
+
+    # ── System Config ────────────────────────────────────────────────────────────
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    mode = Column(String(10), nullable=False, default="single")
