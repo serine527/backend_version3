@@ -1,3 +1,4 @@
+#app\services\auth_service.py
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi import HTTPException, status
@@ -23,7 +24,11 @@ async def login(db: AsyncSession, data: LoginRequest) -> LoginResponse:
         if agent:
             agent_id = agent.id
 
-    token = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username})
+    token = create_access_token({
+    "sub": str(user.id),
+    "role": user.role.value,
+    "username": user.username
+   })
 
     return LoginResponse(
         access_token=token,

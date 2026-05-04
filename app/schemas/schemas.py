@@ -1,3 +1,4 @@
+#app\schemas\schemas.py
 from pydantic import BaseModel
 from typing import Optional, List
 from uuid import UUID
@@ -72,6 +73,8 @@ class ServiceOut(BaseModel):
 # ── Ticket ────────────────────────────────────────────────────────────────────
 class TicketIssue(BaseModel):
     service_id: int
+    sub_service: Optional[str] = None
+    priority: bool = False   # ✅ ADD THIS
 
 class TicketAction(BaseModel):
     action: str   # "call_next" | "skip" | "recall" | "done"

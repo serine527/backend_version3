@@ -113,6 +113,10 @@ class Ticket(Base):
     created_at   = Column(DateTime(timezone=True), server_default=func.now())
     called_at    = Column(DateTime(timezone=True), nullable=True)
     done_at      = Column(DateTime(timezone=True), nullable=True)
-
+    service_id = Column(Integer, ForeignKey("services.id"), nullable=False)
+    sub_service = Column(String(200), nullable=True)
+    priority = Column(Boolean, default=False)
+    
     queue = relationship("Queue", back_populates="tickets")
     agent = relationship("Agent", back_populates="tickets")
+    service = relationship("Service")

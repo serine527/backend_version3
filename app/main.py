@@ -1,3 +1,4 @@
+#app\main.py
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -5,13 +6,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import engine, Base
-from app.models import models  # register all models
+from app.database import engine, Base, AsyncSessionLocal
+from app.models import models
 from app.core.redis import init_redis, close_redis
 from app.core.websocket_manager import redis_subscriber_loop
 from app.routers import auth, agents, tickets, websockets
 from app.services.auth_service import create_admin
-from app.database import AsyncSessionLocal
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,30 +19,49 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ──────────────────────────────────────────────────────────────
     logger.info("Starting CNAS backend…")
 
-    # 1. Create all DB tables
+    # ======================
+    # DATABASE INIT
+    # ======================
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # 2. Seed the default admin account
+    # Admin seed
     async with AsyncSessionLocal() as db:
         await create_admin(db, username="admin", password="admin1234")
 
-    # 3. Connect to Redis
-    await init_redis()
+    subscriber_task = None
 
-    # 4. Start the Redis pub/sub subscriber in the background
-    #    This is what feeds real-time events into the WebSocket manager
-    subscriber_task = asyncio.create_task(redis_subscriber_loop())
-    logger.info("Redis subscriber started")
+    # ======================
+    # REDIS INIT
+    # ======================
+    try:
+        await init_redis()
+        logger.info("Redis connected")
+
+        subscriber_task = asyncio.create_task(redis_subscriber_loop())
+
+    except Exception as e:
+        logger.error(f"Redis init failed: {e}")
 
     yield
 
-    # ── Shutdown ─────────────────────────────────────────────────────────────
-    subscriber_task.cancel()
-    await close_redis()
+    # ======================
+    # SHUTDOWN
+    # ======================
+    if subscriber_task:
+        subscriber_task.cancel()
+        try:
+            await subscriber_task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        await close_redis()
+    except Exception as e:
+        logger.error(f"Redis shutdown error: {e}")
+
     await engine.dispose()
     logger.info("CNAS backend shut down cleanly")
 
@@ -54,19 +73,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# =========================
+# CORS CONFIG (safe baseline)
+# =========================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Vite / CRA dev servers
-    allow_credentials=True,
+    allow_origins=["*"],   # ⚠️ tighten later in production
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-app.include_router(auth.router,       prefix="/api/v1")
-app.include_router(agents.router,     prefix="/api/v1")
-app.include_router(tickets.router,    prefix="/api/v1")
-app.include_router(websockets.router)   # no prefix — WS paths are /ws/...
+# Routers
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(agents.router, prefix="/api/v1")
+app.include_router(tickets.router, prefix="/api/v1")
+app.include_router(websockets.router)
 
 
 @app.get("/", tags=["Health"])
