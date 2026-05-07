@@ -70,8 +70,11 @@ class Agent(Base):
     updated_at       = Column(DateTime(timezone=True), onupdate=func.now())
 
     user    = relationship("User", back_populates="agent")
-    tickets = relationship("Ticket", back_populates="agent")
-
+    tickets = relationship(
+    "Ticket",
+    back_populates="agent",
+    cascade="all, delete-orphan"
+)
 
 # ── Service ───────────────────────────────────────────────────────────────────
 class Service(Base):
@@ -92,7 +95,8 @@ class Queue(Base):
     __table_args__ = (UniqueConstraint("service_id", name="uq_queue_service"),)
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
-    service_id = Column(Integer, ForeignKey("services.id", ondelete="CASCADE"), nullable=False)
+    service_id = Column(Integer,ForeignKey("services.id", ondelete="CASCADE"),nullable=False
+)
     prefix     = Column(String(5), default="A")  # ticket prefix, e.g. A001
     counter    = Column(Integer, default=0)       # last issued ticket number
 
@@ -103,27 +107,40 @@ class Queue(Base):
 # ── Ticket ────────────────────────────────────────────────────────────────────
 class Ticket(Base):
     __tablename__ = "tickets"
-
+     
     id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     number       = Column(String(20), nullable=False)   # e.g. "A001"
     queue_id     = Column(Integer, ForeignKey("queues.id", ondelete="CASCADE"), nullable=False)
-    agent_id     = Column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True)
+    agent_id     = Column( UUID(as_uuid=True),ForeignKey("agents.id", ondelete="SET NULL"),nullable=True)
+    started_at   = Column(DateTime(timezone=True), nullable=True) 
     status       = Column(Enum(TicketStatus), nullable=False, default=TicketStatus.waiting)
     wait_minutes = Column(Integer, default=0)
     created_at   = Column(DateTime(timezone=True), server_default=func.now())
     called_at    = Column(DateTime(timezone=True), nullable=True)
     done_at      = Column(DateTime(timezone=True), nullable=True)
-    service_id = Column(Integer, ForeignKey("services.id"), nullable=False)
+    service_id = Column(
+    Integer,
+    ForeignKey("services.id", ondelete="SET NULL"),
+    nullable=True
+ )
     sub_service = Column(String(200), nullable=True)
     priority = Column(Boolean, default=False)
     
     queue = relationship("Queue", back_populates="tickets")
     agent = relationship("Agent", back_populates="tickets")
-    service = relationship("Service")
-
+    service = relationship("Service", backref="tickets")
     # ── System Config ────────────────────────────────────────────────────────────
 class SystemConfig(Base):
     __tablename__ = "system_config"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     mode = Column(String(10), nullable=False, default="single")
+
+ # ── Counter ────────────────────────────────────────────────────────────
+class Counter(Base):
+    __tablename__ = "counters"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)   # "Counter 1"
+    number = Column(Integer, nullable=False)     # 1, 2, 3...
+    is_active = Column(Boolean, default=True)

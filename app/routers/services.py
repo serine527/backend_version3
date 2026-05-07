@@ -1,3 +1,4 @@
+#app\routers\services.py
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
@@ -21,4 +22,5 @@ async def create_service(data: ServiceCreate, db: AsyncSession = Depends(get_db)
 
 @router.delete("/{service_id}")
 async def delete_service(service_id: int, db: AsyncSession = Depends(get_db)):
+    print("SERVICE DELETE CALLED:", service_id)
     return await service_service.delete_service(db, service_id)

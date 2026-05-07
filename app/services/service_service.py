@@ -1,3 +1,4 @@
+#app\services\service_service.py
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi import HTTPException
@@ -23,12 +24,17 @@ async def create_service(db: AsyncSession, data: ServiceCreate):
 
 
 async def delete_service(db: AsyncSession, service_id: int):
-    result = await db.execute(select(Service).where(Service.id == service_id))
+    print("HARD DELETE SERVICE:", service_id)
+    result = await db.execute(
+        select(Service).where(Service.id == service_id)
+    )
     service = result.scalar_one_or_none()
 
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    service.is_active = False
+    await db.delete(service)
+    await db.flush()
     await db.commit()
-    return {"message": "Service deleted"}
+
+    return {"message": "Service deleted permanently"}

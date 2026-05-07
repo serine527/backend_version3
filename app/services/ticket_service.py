@@ -9,7 +9,7 @@ Every action here:
 
 This is the bridge between HTTP actions and real-time updates.
 """
-
+import string
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -26,49 +26,24 @@ from app.models.models import Queue
 import time
 from sqlalchemy import func, select
 
+def generate_prefix(service, mode: str, service_index: int = 0):
 
-def build_queue_key(service_category: str, sub_service: str | None):
-    if settings.QUEUE_MODE == "single":
-        return f"cnas:queue:{service_category}"
+    # SINGLE MODE
+    if mode == "single":
 
-    return f"cnas:queue:{service_category}:{sub_service or 'default'}"
+        if service.category.value == "prestation":
+            return "A"
 
-async def select_best_agent(db, redis, service, sub_service):
-    query = select(Agent).where(
-        Agent.is_active == True,
-        Agent.is_paused == False,
-        Agent.category == service.category   # ✅ enforce category
-    )
+        return "B"
 
-    result = await db.execute(query)
-    agents = result.scalars().all()
+    # MULTI MODE
+    alphabet = string.ascii_uppercase
 
-    if not agents:
-        raise HTTPException(status_code=400, detail="No agents available")
+    return alphabet[service_index]
 
-    # MULTI MODE → strict matching
-    if settings.QUEUE_MODE == "multi":
-        agents = [
-            a for a in agents
-            if a.assigned_service
-            and a.assigned_service.strip() == sub_service.strip()
-        ]
+def build_queue_key(service_category: str):
+    return f"cnas:queue:{service_category}"
 
-        if not agents:
-            raise HTTPException(status_code=400, detail="No agents for this service")
-
-    # pick least loaded agent
-    best_agent = None
-    min_queue = float("inf")
-
-    for agent in agents:
-        q_len = await redis.llen(f"cnas:queue:agent:{agent.id}")
-
-        if q_len < min_queue:
-            min_queue = q_len
-            best_agent = agent
-
-    return best_agent
 # ── Redis key helpers ─────────────────────────────────────────────────────────
  
 def _stats_key() -> str:
@@ -92,12 +67,7 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    # 2. Pick agent only in MULTI mode
-    agent = None
-    if settings.QUEUE_MODE == "multi":
-        agent = await select_best_agent(db, redis, service, data.sub_service)
-
-    # 3. Get queue config
+    # 2. Get queue
     queue_result = await db.execute(
         select(Queue).where(Queue.service_id == service.id)
     )
@@ -106,22 +76,44 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     if not queue:
         raise HTTPException(status_code=400, detail="No queue found")
 
-    # 4. Generate ticket number
-    counter = await redis.incr(f"cnas:counter:service:{service.id}")
-    ticket_number = f"{queue.prefix}{str(counter).zfill(3)}"
+    # ─────────────────────────────
+    # 3. GLOBAL COUNTER (PER CATEGORY)
+    # ─────────────────────────────
+    counter_key = f"cnas:counter:{service.category.value}"
+    counter = await redis.incr(counter_key)
 
-    # 5. Build queue key (ONLY ONCE)
-    queue_key = build_queue_key(service.category.value, data.sub_service)
+    # ─────────────────────────────
+    # 4. PREFIX (FIXED & CLEAN)
+    # ─────────────────────────────
+    CATEGORY_PREFIX_MAP = {
+        "prestation": "A",
+        "medical": "B"
+    }
 
-    print("QUEUE KEY (ISSUE):", queue_key)
+    prefix = CATEGORY_PREFIX_MAP.get(service.category.value)
 
-    # 6. Create ticket (DB)
+    if not prefix:
+        raise HTTPException(400, "Unknown category")
+
+    # ─────────────────────────────
+    # 5. TICKET NUMBER
+    # ─────────────────────────────
+    ticket_number = f"{prefix}{str(counter).zfill(3)}"
+
+    # ─────────────────────────────
+    # 6. GLOBAL QUEUE KEY (IMPORTANT FIX)
+    # ─────────────────────────────
+    queue_key = build_queue_key(service.category.value)
+
+    # ─────────────────────────────
+    # 7. CREATE TICKET
+    # ─────────────────────────────
     ticket = Ticket(
         number=ticket_number,
         service_id=service.id,
         queue_id=queue.id,
         sub_service=data.sub_service,
-        agent_id=agent.id if agent else None,
+        agent_id=None,
         status=TicketStatus.waiting,
         priority=bool(data.priority)
     )
@@ -130,22 +122,23 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     await db.commit()
     await db.refresh(ticket)
 
-    # 7. Push to Redis queue
+    # ─────────────────────────────
+    # 8. PUSH TO REDIS
+    # ─────────────────────────────
     await push_ticket_to_queue(redis, queue_key, ticket)
 
-    # 8. Get waiting count
     waiting_count = await redis.llen(queue_key)
 
-    # 9. Publish event (WebSocket update)
+    # ─────────────────────────────
+    # 9. EVENT
+    # ─────────────────────────────
     await _publish(redis, {
         "type": "ticket_created",
-        "agent_id": str(agent.id) if agent else None,
         "ticket_number": ticket.number,
         "service_id": service.id,
         "waiting_count": waiting_count
     })
 
-    # 10. Return response
     return TicketOut(
         id=ticket.id,
         number=ticket.number,
@@ -156,7 +149,6 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
         service_name=service.name,
         priority=ticket.priority
     )
-    
 # ── Agent action: call next, skip, recall, done ───────────────────────────────
 async def agent_action(db: AsyncSession, redis: aioredis.Redis, action: str, agent_id: UUID):
     # Get the agent and their assigned queue
@@ -203,11 +195,11 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
         current.status = TicketStatus.done
         current.done_at = datetime.now(timezone.utc)
 
-    # queue key
-    queue_key = build_queue_key(
-        agent.category.value,
-        agent.sub_service or agent.assigned_service
-    )
+    if settings.QUEUE_MODE == "single":
+     queue_key = build_queue_key(agent.category.value)
+    else:
+     queue_key = build_queue_key(agent.category.value)
+     
 
     # next ticket
     ticket_id = await redis.lpop(queue_key)
@@ -347,7 +339,10 @@ async def _toggle_pause(db: AsyncSession, redis: aioredis.Redis, agent: Agent, p
 # ── Queue state (for AgentPage sidebar) ──────────────────────────────────────
 async def get_queue_for_agent(db: AsyncSession, redis: aioredis.Redis, agent_id: UUID):
 
-    result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    result = await db.execute(
+        select(Agent).where(Agent.id == agent_id)
+    )
+
     agent = result.scalar_one_or_none()
 
     if not agent:
@@ -355,41 +350,42 @@ async def get_queue_for_agent(db: AsyncSession, redis: aioredis.Redis, agent_id:
 
     # SINGLE MODE
     if settings.QUEUE_MODE == "single":
-        queue_key = f"cnas:queue:category:{agent.category}"
-        queue_ids = await redis.lrange(queue_key, 0, -1)
-
-        if not queue_ids:
-            return []
-
-        queue_ids = [
-            q.decode() if isinstance(q, bytes) else q
-            for q in queue_ids
-        ]
-
-        result = await db.execute(
-            select(Ticket).where(
-                cast(Ticket.id, PG_UUID).in_(queue_ids)
-            )
-        )
-
-        tickets = result.scalars().all()
-
-        map_t = {str(t.id): t for t in tickets}
-        ordered = [map_t[i] for i in queue_ids if i in map_t]
-
-        return [TicketOut.model_validate(t) for t in ordered]
+        queue_key = f"cnas:queue:{agent.category.value}"
 
     # MULTI MODE
+    else:
+       queue_key = build_queue_key(agent.category.value)
+
+    queue_ids = await redis.lrange(queue_key, 0, -1)
+
+    if not queue_ids:
+        return []
+
+    queue_ids = [
+        q.decode() if isinstance(q, bytes) else q
+        for q in queue_ids
+    ]
+
     result = await db.execute(
-        select(Ticket)
-        .where(
-            Ticket.agent_id == agent.id,
-            Ticket.status.in_([TicketStatus.waiting, TicketStatus.serving])
+        select(Ticket).where(
+            cast(Ticket.id, PG_UUID).in_(queue_ids)
         )
-        .order_by(Ticket.priority.desc(), Ticket.created_at.asc())
     )
 
-    return [TicketOut.model_validate(t) for t in result.scalars().all()]
+    tickets = result.scalars().all()
+
+    map_t = {str(t.id): t for t in tickets}
+
+    ordered = [
+        map_t[i]
+        for i in queue_ids
+        if i in map_t
+    ]
+
+    return [
+        TicketOut.model_validate(t)
+        for t in ordered
+    ]
 
 # ── Stats for admin dashboard ─────────────────────────────────────────────────
 async def get_stats(db: AsyncSession):
@@ -427,13 +423,19 @@ async def get_ticket_wait_time(redis, ticket_id):
         return 0
 
     return int(time.time() - float(start))
-async def push_ticket_to_queue(redis: aioredis.Redis, queue_key: str, ticket: Ticket):
+async def push_ticket_to_queue(
+    redis: aioredis.Redis,
+    queue_key: str,
+    ticket: Ticket
+):
     ticket_id = str(ticket.id)
 
     # store metadata
     await redis.set(
         f"cnas:ticket:{ticket_id}",
-        json.dumps({"priority": bool(ticket.priority)})
+        json.dumps({
+            "priority": bool(ticket.priority)
+        })
     )
 
     # NORMAL ticket → goes to end
@@ -443,20 +445,34 @@ async def push_ticket_to_queue(redis: aioredis.Redis, queue_key: str, ticket: Ti
 
     # PRIORITY ticket logic
     queue = await redis.lrange(queue_key, 0, -1)
-    queue = [q.decode() if isinstance(q, bytes) else q for q in queue]
+
+    queue = [
+        q.decode() if isinstance(q, bytes) else q
+        for q in queue
+    ]
 
     last_priority = None
 
     for tid in queue:
+
         meta = await redis.get(f"cnas:ticket:{tid}")
+
         if meta:
             meta = json.loads(meta)
+
             if meta.get("priority"):
                 last_priority = tid
 
     # insert logic
     if last_priority:
-        await redis.linsert(queue_key, "AFTER", last_priority, ticket_id)
+        await redis.linsert(
+            queue_key,
+            "AFTER",
+            last_priority,
+            ticket_id
+        )
+
     else:
-        # if no priority exists → still keep fairness after current serving logic
+        # no priority tickets yet
         await redis.rpush(queue_key, ticket_id)
+

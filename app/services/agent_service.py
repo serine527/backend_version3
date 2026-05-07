@@ -58,9 +58,11 @@ async def update_agent(db: AsyncSession, agent_id: UUID, data: AgentUpdate):
 
 async def delete_agent(db: AsyncSession, agent_id: UUID):
     agent = await get_agent(db, agent_id)
-    agent.is_active = False   # soft delete — keeps history
+
+    await db.delete(agent)
     await db.commit()
-    return {"message": "Agent deactivated"}
+
+    return {"message": "Agent deleted permanently"}
 
 
 async def change_password(db: AsyncSession, agent_id: UUID, data: AgentPasswordChange):

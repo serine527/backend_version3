@@ -1,11 +1,12 @@
 #app\main.py
 import asyncio
 import logging
+from app.routers import debug
 from contextlib import asynccontextmanager
 from app.routers import services, system, stats
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from app.routers import counters
 from app.database import engine, Base, AsyncSessionLocal
 from app.models import models
 from app.core.redis import init_redis, close_redis
@@ -92,7 +93,8 @@ app.include_router(websockets.router)
 app.include_router(services.router, prefix="/api/v1")
 app.include_router(system.router, prefix="/api/v1")
 app.include_router(stats.router, prefix="/api/v1")
-
+app.include_router(counters.router, prefix="/api/v1")
+app.include_router(debug.router, prefix="/api/v1")
 
 @app.get("/", tags=["Health"])
 async def health():

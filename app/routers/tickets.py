@@ -11,8 +11,13 @@ from app.database import get_db
 from app.core.redis import get_redis
 from app.schemas.schemas import TicketIssue, TicketAction, TicketOut, StatsOut
 from app.services import ticket_service
-
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from app.models.models import Ticket, Queue
+from sqlalchemy import cast
+
+from fastapi import APIRouter, Depends
+import redis.asyncio as aioredis
+from app.core.redis import get_redis
 
 router = APIRouter(prefix="/tickets", tags=["Tickets & Queue"])
 
@@ -70,6 +75,11 @@ async def get_my_queue(
     # 2. Get queue from Redis
     queue_ids = await redis.lrange(queue_key, 0, -1)
 
+    queue_ids = [
+    q.decode() if isinstance(q, bytes) else q
+    for q in queue_ids
+]
+
     if not queue_ids:
         return []
 
@@ -108,3 +118,50 @@ async def get_agent_queue(
     redis: aioredis.Redis = Depends(get_redis),
 ):
     return await ticket_service.get_queue_for_agent(db, redis, agent_id)
+
+@router.get("/queue/{category}")
+async def get_category_queue(
+    category: str,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+
+    queue_key = f"cnas:queue:{category}"
+
+    queue_ids = await redis.lrange(queue_key, 0, -1)
+
+    if not queue_ids:
+        return []
+
+    queue_ids = [
+        q.decode() if isinstance(q, bytes) else q
+        for q in queue_ids
+    ]
+
+    result = await db.execute(
+        select(Ticket).where(
+            cast(Ticket.id, PG_UUID).in_(queue_ids)
+        )
+    )
+
+    tickets = result.scalars().all()
+
+    tickets_map = {str(t.id): t for t in tickets}
+
+    ordered = [
+        tickets_map[t_id]
+        for t_id in queue_ids
+        if t_id in tickets_map
+    ]
+
+    return [
+        {
+            "id": t.id,
+            "number": t.number,
+            "status": t.status,
+            "priority": t.priority,
+            "created_at": t.created_at,
+        }
+        for t in ordered
+    ]
+
