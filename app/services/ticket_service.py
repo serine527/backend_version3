@@ -41,8 +41,12 @@ def generate_prefix(service, mode: str, service_index: int = 0):
 
     return alphabet[service_index]
 
-def build_queue_key(service_category: str):
-    return f"cnas:queue:{service_category}"
+def build_queue_key(category: str, service_id: int | None = None):
+    if settings.QUEUE_MODE == "single":
+        return f"cnas:queue:{category}"
+
+    # MULTI MODE → separate per service
+    return f"cnas:queue:{category}:{service_id}"
 
 # ── Redis key helpers ─────────────────────────────────────────────────────────
  
@@ -103,7 +107,7 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     # ─────────────────────────────
     # 6. GLOBAL QUEUE KEY (IMPORTANT FIX)
     # ─────────────────────────────
-    queue_key = build_queue_key(service.category.value)
+    queue_key = build_queue_key(service.category.value, service.id)
 
     # ─────────────────────────────
     # 7. CREATE TICKET
@@ -195,11 +199,16 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
         current.status = TicketStatus.done
         current.done_at = datetime.now(timezone.utc)
 
+    # ─────────────────────────────
+    # QUEUE KEY FIXED
+    # ─────────────────────────────
     if settings.QUEUE_MODE == "single":
      queue_key = build_queue_key(agent.category.value)
+
     else:
-     queue_key = build_queue_key(agent.category.value)
-     
+    # MULTI MODE → agent must be linked to a service queue
+     service_id = agent.assigned_service  # ⚠️ must store service_id or convert it
+     queue_key = build_queue_key(agent.category.value, service_id)
 
     # next ticket
     ticket_id = await redis.lpop(queue_key)
@@ -210,7 +219,6 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
 
     ticket_id = ticket_id.decode() if isinstance(ticket_id, bytes) else ticket_id
 
-    # FIX: safe UUID match
     result = await db.execute(
         select(Ticket).where(cast(Ticket.id, PG_UUID) == ticket_id)
     )
@@ -229,7 +237,6 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
 
     await db.commit()
 
-    # runtime tracking
     await redis.set(f"cnas:current:agent:{agent.id}", str(next_ticket.id))
     await redis.set(f"cnas:start:ticket:{next_ticket.id}", str(time.time()))
 
@@ -354,7 +361,7 @@ async def get_queue_for_agent(db: AsyncSession, redis: aioredis.Redis, agent_id:
 
     # MULTI MODE
     else:
-       queue_key = build_queue_key(agent.category.value)
+        queue_key = f"cnas:queue:service:{agent.assigned_service}"
 
     queue_ids = await redis.lrange(queue_key, 0, -1)
 
