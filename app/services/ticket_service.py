@@ -41,12 +41,8 @@ def generate_prefix(service, mode: str, service_index: int = 0):
 
     return alphabet[service_index]
 
-def build_queue_key(category: str, service_id: int | None = None):
-    if settings.QUEUE_MODE == "single":
-        return f"cnas:queue:{category}"
-
-    # MULTI MODE → separate per service
-    return f"cnas:queue:{category}:{service_id}"
+def build_queue_key(category: str):
+    return f"cnas:queue:{category}"
 
 # ── Redis key helpers ─────────────────────────────────────────────────────────
  
@@ -62,7 +58,6 @@ async def _publish(redis: aioredis.Redis, event: dict):
 # ── Issue a new ticket (citizen scans / walks up) ────────────────────────────
 async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssue):
 
-    # 1. Get service
     result = await db.execute(
         select(Service).where(Service.id == data.service_id)
     )
@@ -71,7 +66,6 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    # 2. Get queue
     queue_result = await db.execute(
         select(Queue).where(Queue.service_id == service.id)
     )
@@ -80,38 +74,25 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     if not queue:
         raise HTTPException(status_code=400, detail="No queue found")
 
-    # ─────────────────────────────
-    # 3. GLOBAL COUNTER (PER CATEGORY)
-    # ─────────────────────────────
+    # counter per category
     counter_key = f"cnas:counter:{service.category.value}"
     counter = await redis.incr(counter_key)
 
-    # ─────────────────────────────
-    # 4. PREFIX (FIXED & CLEAN)
-    # ─────────────────────────────
-    CATEGORY_PREFIX_MAP = {
+    prefix_map = {
         "prestation": "A",
         "medical": "B"
     }
 
-    prefix = CATEGORY_PREFIX_MAP.get(service.category.value)
+    prefix = prefix_map.get(service.category.value)
 
     if not prefix:
         raise HTTPException(400, "Unknown category")
 
-    # ─────────────────────────────
-    # 5. TICKET NUMBER
-    # ─────────────────────────────
     ticket_number = f"{prefix}{str(counter).zfill(3)}"
 
-    # ─────────────────────────────
-    # 6. GLOBAL QUEUE KEY (IMPORTANT FIX)
-    # ─────────────────────────────
-    queue_key = build_queue_key(service.category.value, service.id)
-
-    # ─────────────────────────────
-    # 7. CREATE TICKET
-    # ─────────────────────────────
+    # SINGLE MODE QUEUE KEY
+    queue_key = build_queue_key(service.category.value)
+    print("QUEUE KEY USED:", queue_key)
     ticket = Ticket(
         number=ticket_number,
         service_id=service.id,
@@ -126,16 +107,10 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     await db.commit()
     await db.refresh(ticket)
 
-    # ─────────────────────────────
-    # 8. PUSH TO REDIS
-    # ─────────────────────────────
     await push_ticket_to_queue(redis, queue_key, ticket)
 
     waiting_count = await redis.llen(queue_key)
 
-    # ─────────────────────────────
-    # 9. EVENT
-    # ─────────────────────────────
     await _publish(redis, {
         "type": "ticket_created",
         "ticket_number": ticket.number,
@@ -144,13 +119,13 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     })
 
     return TicketOut(
-        id=ticket.id,
-        number=ticket.number,
-        status=ticket.status,
-        wait_minutes=ticket.wait_minutes,
-        created_at=ticket.created_at,
-        called_at=ticket.called_at,
-        service_name=service.name,
+        id=t.id,
+        number=t.number,
+        status=t.status,
+        wait_minutes=0,
+        created_at=t.created_at,
+        called_at=t.called_at,
+        service_name=t.service.name if t.service else None,
         priority=ticket.priority
     )
 # ── Agent action: call next, skip, recall, done ───────────────────────────────
@@ -186,7 +161,6 @@ async def agent_action(db: AsyncSession, redis: aioredis.Redis, action: str, age
 
 async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
 
-    # finish current ticket
     result = await db.execute(
         select(Ticket).where(
             Ticket.agent_id == agent.id,
@@ -199,18 +173,9 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
         current.status = TicketStatus.done
         current.done_at = datetime.now(timezone.utc)
 
-    # ─────────────────────────────
-    # QUEUE KEY FIXED
-    # ─────────────────────────────
-    if settings.QUEUE_MODE == "single":
-     queue_key = build_queue_key(agent.category.value)
+    # SINGLE MODE QUEUE
+    queue_key = build_queue_key(agent.category.value)
 
-    else:
-    # MULTI MODE → agent must be linked to a service queue
-     service_id = agent.assigned_service  # ⚠️ must store service_id or convert it
-     queue_key = build_queue_key(agent.category.value, service_id)
-
-    # next ticket
     ticket_id = await redis.lpop(queue_key)
 
     if not ticket_id:
@@ -255,7 +220,6 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
         "ticket_number": next_ticket.number,
         "waiting": waiting_count
     }
-    
 async def _skip_current(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
     result = await db.execute(
         select(Ticket).where(
@@ -355,13 +319,7 @@ async def get_queue_for_agent(db: AsyncSession, redis: aioredis.Redis, agent_id:
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # SINGLE MODE
-    if settings.QUEUE_MODE == "single":
-        queue_key = f"cnas:queue:{agent.category.value}"
-
-    # MULTI MODE
-    else:
-        queue_key = f"cnas:queue:service:{agent.assigned_service}"
+    queue_key = build_queue_key(agent.category.value)
 
     queue_ids = await redis.lrange(queue_key, 0, -1)
 
@@ -383,16 +341,9 @@ async def get_queue_for_agent(db: AsyncSession, redis: aioredis.Redis, agent_id:
 
     map_t = {str(t.id): t for t in tickets}
 
-    ordered = [
-        map_t[i]
-        for i in queue_ids
-        if i in map_t
-    ]
+    ordered = [map_t[i] for i in queue_ids if i in map_t]
 
-    return [
-        TicketOut.model_validate(t)
-        for t in ordered
-    ]
+    return [TicketOut.model_validate(t) for t in ordered]
 
 # ── Stats for admin dashboard ─────────────────────────────────────────────────
 async def get_stats(db: AsyncSession):

@@ -53,15 +53,7 @@ async def agent_action(
 # =========================
 # STATS
 # =========================
-@router.get("/stats", response_model=StatsOut)
-async def get_stats(db: AsyncSession = Depends(get_db)):
-    return await ticket_service.get_stats(db)
 
-
-# =========================
-# SERVICE QUEUE (FIXED)
-# =========================
-@router.get("/queue/{category}/{sub_service}")
 async def get_my_queue(
     category: str,
     sub_service: str,
