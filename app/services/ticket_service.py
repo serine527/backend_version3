@@ -119,15 +119,15 @@ async def issue_ticket(db: AsyncSession, redis: aioredis.Redis, data: TicketIssu
     })
 
     return TicketOut(
-        id=t.id,
-        number=t.number,
-        status=t.status,
-        wait_minutes=0,
-        created_at=t.created_at,
-        called_at=t.called_at,
-        service_name=t.service.name if t.service else None,
-        priority=ticket.priority
-    )
+    id=ticket.id,
+    number=ticket.number,
+    status=ticket.status,
+    wait_minutes=0,
+    created_at=ticket.created_at,
+    called_at=ticket.called_at,
+    service_name=service.name if service else None,
+    priority=ticket.priority
+ )
 # ── Agent action: call next, skip, recall, done ───────────────────────────────
 async def agent_action(db: AsyncSession, redis: aioredis.Redis, action: str, agent_id: UUID):
     # Get the agent and their assigned queue
@@ -388,49 +388,58 @@ async def push_ticket_to_queue(
 ):
     ticket_id = str(ticket.id)
 
-    # store metadata
+    # ─────────────────────────────
+    # store metadata safely
+    # ─────────────────────────────
     await redis.set(
         f"cnas:ticket:{ticket_id}",
-        json.dumps({
-            "priority": bool(ticket.priority)
-        })
+        json.dumps({"priority": bool(ticket.priority)})
     )
 
-    # NORMAL ticket → goes to end
+    # ─────────────────────────────
+    # NORMAL ticket → push to end
+    # ─────────────────────────────
     if not ticket.priority:
         await redis.rpush(queue_key, ticket_id)
         return
 
+    # ─────────────────────────────
     # PRIORITY ticket logic
-    queue = await redis.lrange(queue_key, 0, -1)
+    # must be placed AFTER last priority ticket
+    # ─────────────────────────────
+    try:
+        queue = await redis.lrange(queue_key, 0, -1)
+        queue = [
+            q.decode() if isinstance(q, bytes) else q
+            for q in queue
+        ]
 
-    queue = [
-        q.decode() if isinstance(q, bytes) else q
-        for q in queue
-    ]
+        last_priority = None
 
-    last_priority = None
+        for tid in queue:
+            meta = await redis.get(f"cnas:ticket:{tid}")
 
-    for tid in queue:
+            if not meta:
+                continue
 
-        meta = await redis.get(f"cnas:ticket:{tid}")
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                continue
 
-        if meta:
-            meta = json.loads(meta)
-
-            if meta.get("priority"):
+            if meta.get("priority") is True:
                 last_priority = tid
 
-    # insert logic
-    if last_priority:
-        await redis.linsert(
-            queue_key,
-            "AFTER",
-            last_priority,
-            ticket_id
-        )
+        # ─────────────────────────────
+        # INSERT AFTER LAST PRIORITY
+        # ─────────────────────────────
+        if last_priority:
+            await redis.linsert(queue_key, "AFTER", last_priority, ticket_id)
+        else:
+            # no priority exists → goes to FRONT (important for your rule)
+            await redis.lpush(queue_key, ticket_id)
 
-    else:
-        # no priority tickets yet
+    except Exception as e:
+        # 🚨 IMPORTANT: fallback so ticket creation NEVER breaks
+        print("QUEUE PRIORITY ERROR:", e)
         await redis.rpush(queue_key, ticket_id)
-
