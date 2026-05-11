@@ -14,10 +14,13 @@ from app.services import ticket_service
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from app.models.models import Ticket, Queue
 from sqlalchemy import cast
-
-from fastapi import APIRouter, Depends
+from fastapi import Path
+from sqlalchemy import delete
+from fastapi import APIRouter, Depends, HTTPException
 import redis.asyncio as aioredis
 from app.core.redis import get_redis
+from app.services.ticket_service import _publish
+
 
 router = APIRouter(prefix="/tickets", tags=["Tickets & Queue"])
 
@@ -157,3 +160,39 @@ async def get_category_queue(
         for t in ordered
     ]
 
+@router.delete("/{ticket_id}")
+async def cancel_ticket(
+    ticket_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    result = await db.execute(
+        select(Ticket).where(Ticket.id == ticket_id)
+    )
+
+    ticket = result.scalar_one_or_none()
+
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    # remove from redis queue
+    service_result = await db.execute(
+        select(Service).where(Service.id == ticket.service_id)
+    )
+    service = service_result.scalar_one_or_none()
+
+    if service:
+        queue_key = f"cnas:queue:{service.category.value}"
+        await redis.lrem(queue_key, 0, str(ticket.id))
+
+    # delete from DB
+    await db.delete(ticket)
+    await db.commit()
+
+    await _publish(redis, {
+        "type": "ticket_cancelled",
+        "ticket_id": str(ticket_id),
+        "ticket_number": ticket.number
+    })
+
+    return {"message": "ticket cancelled"}
