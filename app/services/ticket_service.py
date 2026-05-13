@@ -25,6 +25,8 @@ from app.config import settings
 from app.models.models import Queue
 import time
 from sqlalchemy import func, select
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
 
 def generate_prefix(service, mode: str, service_index: int = 0):
 
@@ -199,12 +201,27 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
     next_ticket.agent_id = agent.id
     next_ticket.called_at = now
     next_ticket.started_at = now
+    
+    from app.core.websocket_manager import manager
+
+    await manager.broadcast_to_room(
+    f"ticket:{next_ticket.id}",
+    {
+        "type": "ticket_called",
+        "ticket_id": str(next_ticket.id),
+        "ticket_number": next_ticket.number,
+        "agent_id": str(agent.id),
+        "service": agent.category.value,
+    }
+)
 
     await db.commit()
+
 
     await redis.set(f"cnas:current:agent:{agent.id}", str(next_ticket.id))
     await redis.set(f"cnas:start:ticket:{next_ticket.id}", str(time.time()))
 
+   
     waiting_count = await redis.llen(queue_key)
 
     await _publish(redis, {

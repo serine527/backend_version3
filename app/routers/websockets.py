@@ -79,3 +79,31 @@ async def ws_display(websocket: WebSocket):
                 await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         manager.disconnect(websocket, "display")
+@router.websocket("/ws/ticket/{ticket_id}")
+async def ws_ticket(websocket: WebSocket, ticket_id: UUID):
+
+    room = f"ticket:{ticket_id}"
+
+    await manager.connect(websocket, room)
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+
+            msg = json.loads(data)
+
+            if msg.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, room)
+
+        from django.urls import re_path
+        from tickets.consumers import TicketConsumer
+
+    websocket_urlpatterns = [
+         re_path(
+        r"ws/ticket/(?P<ticket_id>[^/]+)/$",
+        TicketConsumer.as_asgi()
+    ),
+]
