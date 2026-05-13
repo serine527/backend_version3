@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException
 import redis.asyncio as aioredis
 from app.core.redis import get_redis
 from app.services.ticket_service import _publish
-
+from sqlalchemy.orm import selectinload
 
 router = APIRouter(prefix="/tickets", tags=["Tickets & Queue"])
 
@@ -134,10 +134,10 @@ async def get_category_queue(
     ]
 
     result = await db.execute(
-        select(Ticket).where(
-            cast(Ticket.id, PG_UUID).in_(queue_ids)
-        )
-    )
+    select(Ticket)
+    .options(selectinload(Ticket.service))  # ✅ THIS LINE FIXES EVERYTHING
+    .where(cast(Ticket.id, PG_UUID).in_(queue_ids))
+ )
 
     tickets = result.scalars().all()
 
@@ -150,12 +150,14 @@ async def get_category_queue(
     ]
 
     return [
-        {
-            "id": t.id,
-            "number": t.number,
-            "status": t.status,
-            "priority": t.priority,
-            "created_at": t.created_at,
+        { "id": t.id,
+        "number": t.number,
+        "status": t.status,
+        "priority": t.priority,
+        "created_at": t.created_at,
+        "sub_service": t.sub_service,
+        "category": t.service.category.value if t.service else None,
+        "service_name": t.service.name if t.service else None,
         }
         for t in ordered
     ]
