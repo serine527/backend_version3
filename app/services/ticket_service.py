@@ -360,7 +360,19 @@ async def get_queue_for_agent(db: AsyncSession, redis: aioredis.Redis, agent_id:
 
     ordered = [map_t[i] for i in queue_ids if i in map_t]
 
-    return [TicketOut.model_validate(t) for t in ordered]
+    return [
+    {
+        "id": t.id,
+        "number": t.number,
+        "status": t.status,
+        "priority": t.priority,
+        "created_at": t.created_at,
+        "sub_service": t.sub_service,
+        "category": t.service.category.value if t.service else None,
+        "service_name": t.service.name if t.service else None,
+    }
+    for t in ordered
+]
 
 # ── Stats for admin dashboard ─────────────────────────────────────────────────
 async def get_stats(db: AsyncSession):
