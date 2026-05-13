@@ -1,1 +1,1 @@
-from app.models import models
+from app.models.models import Agent, Counter, Ticket, TicketStatus
