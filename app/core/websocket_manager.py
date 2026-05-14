@@ -61,7 +61,9 @@ class ConnectionManager:
         if event_type == "ticket_called":
             await self.broadcast_to_room("display", event)
 
-
+        ticket_id = event.get("ticket_id")
+        if ticket_id:
+            await self.broadcast_to_room(f"ticket:{ticket_id}", event)
 # ✅ IMPORTANT: THIS WAS MISSING
 manager = ConnectionManager()
 

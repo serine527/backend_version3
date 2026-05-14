@@ -25,8 +25,8 @@ from app.config import settings
 from app.models.models import Queue
 import time
 from sqlalchemy import func, select
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync
+
+
 
 def generate_prefix(service, mode: str, service_index: int = 0):
 
@@ -169,7 +169,7 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
             Ticket.status == TicketStatus.serving
         )
     )
-    current = result.scalar_one_or_none()
+    current = result.scalars().first()
 
     if current:
         current.status = TicketStatus.done
@@ -245,7 +245,7 @@ async def _skip_current(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
         )
     )
 
-    ticket = result.scalar_one_or_none()
+    ticket = result.scalars().first()
 
     if not ticket:
         raise HTTPException(status_code=404, detail="No ticket currently serving")
@@ -269,7 +269,7 @@ async def _recall_current(db: AsyncSession, redis: aioredis.Redis, agent: Agent)
     result = await db.execute(
         select(Ticket).where(Ticket.agent_id == agent.id, Ticket.status == TicketStatus.serving)
     )
-    ticket = result.scalar_one_or_none()
+    ticket = result.scalars().first()
     if not ticket:
         raise HTTPException(status_code=404, detail="No ticket currently serving")
 
@@ -290,7 +290,7 @@ async def _mark_done(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
         )
     )
 
-    ticket = result.scalar_one_or_none()
+    ticket = result.scalars().first()
 
     if not ticket:
         raise HTTPException(status_code=404, detail="No ticket currently serving")
