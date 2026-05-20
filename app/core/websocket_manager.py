@@ -42,6 +42,7 @@ class ConnectionManager:
                 self.disconnect(ws, room)
 
     async def dispatch_event(self, raw):
+        print("RECEIVED FROM REDIS:", raw)
         try:
             event = json.loads(raw)
         except:
@@ -49,7 +50,7 @@ class ConnectionManager:
 
         event_type = event.get("type")
         agent_id = event.get("agent_id")
-
+        
         # Admin always receives
         await self.broadcast_to_room("admin", event)
 

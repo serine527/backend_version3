@@ -74,7 +74,7 @@ class ServiceOut(BaseModel):
 class TicketIssue(BaseModel):
     service_id: int
     sub_service: Optional[str] = None
-    priority: bool = False   # ✅ ADD THIS
+    priority: bool = False   # 
 
 class TicketAction(BaseModel):
     action: str   # "call_next" | "skip" | "recall" | "done"
@@ -100,3 +100,15 @@ class StatsOut(BaseModel):
     avg_wait_minutes: float
     tickets_today: int
     served_today: int
+
+class CounterOut(BaseModel):
+    id: int
+    name: str
+    number: Optional[int]
+    is_active: bool
+    agent_id: UUID | None
+    model_config = {"from_attributes": True}
+
+class CounterCreate(BaseModel):
+    name: str
+ 

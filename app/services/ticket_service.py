@@ -25,7 +25,7 @@ from app.config import settings
 from app.models.models import Queue
 import time
 from sqlalchemy import func, select
-
+from app.models.models import Counter
 
 
 def generate_prefix(service, mode: str, service_index: int = 0):
@@ -54,7 +54,9 @@ def _stats_key() -> str:
 
 # ── Publish event to Redis pub/sub ────────────────────────────────────────────
 async def _publish(redis: aioredis.Redis, event: dict):
+    print("PUBLISHING EVENT:", event)
     await redis.publish("cnas:events", json.dumps(event, default=str))
+
 
 
 # ── Issue a new ticket (citizen scans / walks up) ────────────────────────────
@@ -163,25 +165,21 @@ async def agent_action(db: AsyncSession, redis: aioredis.Redis, action: str, age
 
 async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
 
+    # 1. GET current serving ticket
     result = await db.execute(
         select(Ticket).where(
             Ticket.agent_id == agent.id,
             Ticket.status == TicketStatus.serving
         )
     )
-    current = result.scalars().first()
+    current = result.scalar_one_or_none()
 
-    if current:
-        current.status = TicketStatus.done
-        current.done_at = datetime.now(timezone.utc)
-
-    # SINGLE MODE QUEUE
+    # 2. POP next ticket FIRST (safer ordering)
     queue_key = build_queue_key(agent.category.value)
 
     ticket_id = await redis.lpop(queue_key)
 
     if not ticket_id:
-        await db.commit()
         return {"message": "No tickets waiting"}
 
     ticket_id = ticket_id.decode() if isinstance(ticket_id, bytes) else ticket_id
@@ -192,50 +190,62 @@ async def _call_next(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
     next_ticket = result.scalar_one_or_none()
 
     if not next_ticket:
-        await db.commit()
         return {"message": "Ticket not found"}
 
     now = datetime.now(timezone.utc)
 
+    # 3. IMPORTANT: clear old serving FIRST
+    if current:
+        current.status = TicketStatus.done
+        current.done_at = now
+        current.agent_id = None  # 👈 important fix
+
+    # 4. assign new serving
     next_ticket.status = TicketStatus.serving
     next_ticket.agent_id = agent.id
     next_ticket.called_at = now
     next_ticket.started_at = now
-    
+
     from app.core.websocket_manager import manager
-
-    await manager.broadcast_to_room(
-    f"ticket:{next_ticket.id}",
-    {
-        "type": "ticket_called",
-        "ticket_id": str(next_ticket.id),
-        "ticket_number": next_ticket.number,
-        "agent_id": str(agent.id),
-        "service": agent.category.value,
-    }
-)
-
+    
     await db.commit()
 
-
+    # 5. Redis sync AFTER commit
     await redis.set(f"cnas:current:agent:{agent.id}", str(next_ticket.id))
     await redis.set(f"cnas:start:ticket:{next_ticket.id}", str(time.time()))
 
-   
     waiting_count = await redis.llen(queue_key)
+
+    counter_result = await db.execute(
+    select(Counter).where(Counter.agent_id == agent.id)
+)
+    counter = counter_result.scalar_one_or_none()
+
+    # ✅ DIRECT SEND (CRITICAL)
+    await manager.broadcast_to_room(
+       f"ticket:{next_ticket.id}",
+       {
+          "type": "ticket_called",
+          "ticket_id": str(next_ticket.id),
+          "ticket_number": next_ticket.number,
+          "agent_id": str(agent.id),
+          "counter": counter.number if counter else None
+    }
+)
 
     await _publish(redis, {
         "type": "ticket_called",
         "agent_id": str(agent.id),
-        "agent_name": agent.name,
         "ticket_number": next_ticket.number,
         "ticket_id": str(next_ticket.id),
         "waiting_count": waiting_count,
+        "counter": counter.number if counter else None
     })
 
     return {
         "ticket_number": next_ticket.number,
-        "waiting": waiting_count
+        "waiting": waiting_count,
+        "current_ticket": str(next_ticket.id)
     }
 async def _skip_current(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
     result = await db.execute(
@@ -245,7 +255,7 @@ async def _skip_current(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
         )
     )
 
-    ticket = result.scalars().first()
+    ticket = result.scalar_one_or_none()
 
     if not ticket:
         raise HTTPException(status_code=404, detail="No ticket currently serving")
@@ -269,7 +279,7 @@ async def _recall_current(db: AsyncSession, redis: aioredis.Redis, agent: Agent)
     result = await db.execute(
         select(Ticket).where(Ticket.agent_id == agent.id, Ticket.status == TicketStatus.serving)
     )
-    ticket = result.scalars().first()
+    ticket = result.scalar_one_or_none()
     if not ticket:
         raise HTTPException(status_code=404, detail="No ticket currently serving")
 
@@ -290,7 +300,7 @@ async def _mark_done(db: AsyncSession, redis: aioredis.Redis, agent: Agent):
         )
     )
 
-    ticket = result.scalars().first()
+    ticket = result.scalar_one_or_none()
 
     if not ticket:
         raise HTTPException(status_code=404, detail="No ticket currently serving")
@@ -327,10 +337,10 @@ async def _toggle_pause(db: AsyncSession, redis: aioredis.Redis, agent: Agent, p
 # ── Queue state (for AgentPage sidebar) ──────────────────────────────────────
 async def get_queue_for_agent(db: AsyncSession, redis: aioredis.Redis, agent_id: UUID):
 
+    # 1. Get agent
     result = await db.execute(
         select(Agent).where(Agent.id == agent_id)
     )
-
     agent = result.scalar_one_or_none()
 
     if not agent:
@@ -338,41 +348,65 @@ async def get_queue_for_agent(db: AsyncSession, redis: aioredis.Redis, agent_id:
 
     queue_key = build_queue_key(agent.category.value)
 
+    # 2. Get waiting queue from Redis
     queue_ids = await redis.lrange(queue_key, 0, -1)
-
-    if not queue_ids:
-        return []
 
     queue_ids = [
         q.decode() if isinstance(q, bytes) else q
         for q in queue_ids
     ]
 
-    result = await db.execute(
+    # 3. Get SERVING ticket (IMPORTANT FIX)
+    serving_result = await db.execute(
         select(Ticket).where(
-            cast(Ticket.id, PG_UUID).in_(queue_ids)
+            Ticket.agent_id == agent_id,
+            Ticket.status == TicketStatus.serving
         )
     )
+    serving_ticket = serving_result.scalar_one_or_none()
 
-    tickets = result.scalars().all()
+    serving_id = str(serving_ticket.id) if serving_ticket else None
+
+    # 4. Fetch queue tickets from DB
+    tickets = []
+    if queue_ids:
+        result = await db.execute(
+            select(Ticket).where(
+                cast(Ticket.id, PG_UUID).in_(queue_ids)
+            )
+        )
+        tickets = result.scalars().all()
 
     map_t = {str(t.id): t for t in tickets}
-
     ordered = [map_t[i] for i in queue_ids if i in map_t]
 
-    return [
-    {
-        "id": t.id,
-        "number": t.number,
-        "status": t.status,
-        "priority": t.priority,
-        "created_at": t.created_at,
-        "sub_service": t.sub_service,
-        "category": t.service.category.value if t.service else None,
-        "service_name": t.service.name if t.service else None,
+    # 5. Return BOTH queue + current ticket
+    return {
+        "current_ticket": {
+            "id": serving_ticket.id,
+            "number": serving_ticket.number,
+            "status": serving_ticket.status,
+            "priority": serving_ticket.priority,
+            "created_at": serving_ticket.created_at,
+            "sub_service": serving_ticket.sub_service,
+            "category": serving_ticket.service.category.value if serving_ticket.service else None,
+            "service_name": serving_ticket.service.name if serving_ticket.service else None,
+        } if serving_ticket else None,
+
+        "queue": [
+            {
+                "id": t.id,
+                "number": t.number,
+                "status": t.status,
+                "priority": t.priority,
+                "created_at": t.created_at,
+                "sub_service": t.sub_service,
+                "category": t.service.category.value if t.service else None,
+                "service_name": t.service.name if t.service else None,
+            }
+            for t in ordered
+        ]
     }
-    for t in ordered
-]
 
 # ── Stats for admin dashboard ─────────────────────────────────────────────────
 async def get_stats(db: AsyncSession):
@@ -472,3 +506,23 @@ async def push_ticket_to_queue(
         # 🚨 IMPORTANT: fallback so ticket creation NEVER breaks
         print("QUEUE PRIORITY ERROR:", e)
         await redis.rpush(queue_key, ticket_id)
+
+async def get_current_ticket(db: AsyncSession, agent_id: UUID):
+    result = await db.execute(
+        select(Ticket).where(
+            Ticket.agent_id == agent_id,
+            Ticket.status == TicketStatus.serving
+        )
+    )
+    ticket = result.scalar_one_or_none()
+
+    if not ticket:
+        return None
+
+    return {
+        "id": str(ticket.id),
+        "number": ticket.number,
+        "status": ticket.status.value,
+        "sub_service": ticket.sub_service,
+        "created_at": ticket.created_at
+    }        

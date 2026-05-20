@@ -1,11 +1,6 @@
 """
 Database models — match the frontend data structures exactly:
 
-  User      → login credentials (admin or agent)
-  Agent     → agent profile with queue/service assignment
-  Service   → a service category (prestation or medical) with sub-services
-  Queue     → one queue per service
-  Ticket    → a citizen's ticket in a queue
 """
 
 import uuid
@@ -143,6 +138,10 @@ class Counter(Base):
     __tablename__ = "counters"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(100), nullable=False)   # "Counter 1"
-    number = Column(Integer, nullable=False)     # 1, 2, 3...
+    name = Column(String(100), nullable=False)
+    number = Column(Integer, nullable=True)
     is_active = Column(Boolean, default=True)
+
+    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
+
+    agent = relationship("Agent")
