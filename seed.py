@@ -64,6 +64,29 @@ async def seed():
 
     async with AsyncSession() as db:
 
+
+            # ── ADMIN USER (ADD HERE FIRST) ─────────────────────
+        ADMIN_USERNAME = "admin"
+        ADMIN_PASSWORD = "admin1234"
+
+        result = await db.execute(
+            select(User).where(User.username == ADMIN_USERNAME)
+        )
+        admin = result.scalar_one_or_none()
+
+        if not admin:
+            admin = User(
+                username=ADMIN_USERNAME,
+                password=hash_password(ADMIN_PASSWORD),
+                role=UserRole.admin
+            )
+            db.add(admin)
+            await db.flush()
+
+            print("✅ Admin created")
+        else:
+            print("ℹ️ Admin already exists")
+
         # ─────────────────────────────────────────────
         # SERVICES
         # ─────────────────────────────────────────────
