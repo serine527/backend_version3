@@ -103,7 +103,7 @@ async def get_category_queue(
         {
             "id": t.id,
             "number": t.number,
-            "status": t.status,
+            "status": t.status.value if hasattr(t.status, "value") else t.status,
             "priority": t.priority,
             "created_at": t.created_at,
             "sub_service": t.sub_service,
